@@ -5,11 +5,12 @@ This project focuses on building a time series forecasting model using the Proph
 
 ## Files and Structure
 `data.zip`: Compressed folder containing the datasets used in the project, including:
-    `train.csv` - historical sales data
-    `test.csv` - future dates to forecast
-    `stores.csv` - store-specific information
-    `oil.csv` - oil price data
-    `holidays_events.csv` - holiday and event data
+
+* `train.csv` - historical sales data
+* `test.csv` - future dates to forecast
+*  `stores.csv` - store-specific information
+* `oil.csv` - oil price data
+* `holidays_events.csv` - holiday and event data
 
 The data was taken from [this Kaggle competition](https://www.kaggle.com/c/store-sales-time-series-forecasting/data)
 
