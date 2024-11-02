@@ -1,0 +1,288 @@
+---
+title: "Time Series Forecasting with Robyn"
+author: "Emiliia Lekhman"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Introduction
+
+This report presents a time series forecasting model using the Robyn library in R.
+
+## Load Libraries
+
+```{r, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(lubridate)
+library(tidyr)
+library(gridExtra)
+library(tidyverse)
+library(zoo)
+library(siMMMulator)
+library(forecast)
+library(Robyn)
+library(prophet)
+
+create_files <- TRUE
+```
+
+# Generate Data with siMMMulator
+
+## Step 0 : Define Basic Parameters
+```{r, message=FALSE, warning=FALSE}
+my_variables <- step_0_define_basic_parameters(years = 2,
+                                               channels_impressions = c("Facebook", "TV", "Long_Form_Video"),
+                                               channels_clicks = c("Search"),
+                                               frequency_of_campaigns = 1,
+                                               true_cvr = c(0.001, 0.002, 0.003, 0.002),
+                                               revenue_per_conv = 1, 
+                                               start_date = "2017/1/1"
+)
+```
+
+## Step 1 : Simulate Daily Baseline Sales
+```{r, message=FALSE, warning=FALSE}
+df_baseline <- step_1_create_baseline(
+                        my_variables = my_variables,
+                        base_p = 500000,
+                        trend_p = 1.8,
+                        temp_var = 8,
+                        temp_coef_mean = 50000,
+                        temp_coef_sd = 5000,
+                        error_std = 100000)
+optional_step_1.5_plot_baseline_sales(df_baseline = df_baseline)
+```
+
+## Step 2 : Generate Ad Spend
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step2 <- step_2_ads_spend(
+                    my_variables = my_variables,
+                    campaign_spend_mean = 329000,
+                    campaign_spend_std = 100000,
+                    max_min_proportion_on_each_channel <- c(0.15, 0.20,
+                                                            0.10, 0.15,
+                                                            0.05, 0.20)
+                )
+optional_step_2.5_plot_ad_spend(df_ads_step2 = df_ads_step2)
+```
+
+## Step 3 : Generate Media Variables
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step3 <- step_3_generate_media(
+  my_variables = my_variables,
+  df_ads_step2 = df_ads_step2,
+  true_cpm = c(2, 20, 10, NA),
+  true_cpc = c(NA, NA, NA, 0.25),
+  mean_noisy_cpm_cpc = c(1, 0.05, 0.01, 0.1),
+  std_noisy_cpm_cpc = c(0.01, 0.15, 0.01, 0.01)
+)
+```
+
+## Step 4 : Generate Noisy CVRs
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step4 <- step_4_generate_cvr(
+  my_variables = my_variables,
+  df_ads_step3 = df_ads_step3,
+  mean_noisy_cvr = c(0, 0.0001, 0.0002, 0), 
+  std_noisy_cvr = c(0.001, 0.002, 0.003, 0.002)
+  )
+```
+
+## Step 5 : Transforming Media Variables
+
+### Step 5a : Pivoting the table to an MMM format
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step5a_before_mmm <- step_5a_pivot_to_mmm_format(
+                    my_variables = my_variables,
+                    df_ads_step4 = df_ads_step4
+                    )
+```
+
+### Step 5b : Apply Adstock
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step5b <- step_5b_decay(
+  my_variables = my_variables,
+  df_ads_step5a_before_mmm = df_ads_step5a_before_mmm,
+  true_lambda_decay = c(0.1, 0.2, 0.3, 0.4)
+)
+```
+
+### Step 5c: Applying Diminishing Returns to Media Variables
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step5c <- step_5c_diminishing_returns(
+  my_variables = my_variables,
+  df_ads_step5b = df_ads_step5b,
+  alpha_saturation = c(2, 2, 2, 2),
+  gamma_saturation = c(0.1, 0.2, 0.3, 0.2)
+)
+```
+
+## Step 6 : Calculating Conversions
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step6 <- step_6_calculating_conversions(
+  my_variables = my_variables,
+  df_ads_step5c = df_ads_step5c
+)
+```
+
+## Step 7 : Expanded Data Frame
+
+```{r, message=FALSE, warning=FALSE}
+df_ads_step7 <- step_7_expanded_df(
+  my_variables = my_variables,
+  df_ads_step6 = df_ads_step6,
+  df_baseline = df_baseline
+)
+```
+
+## Step 8 : Calculating ROI
+
+```{r, message=FALSE, warning=FALSE}
+step_8_calculate_roi(
+  my_variables = my_variables,
+  df_ads_step7 = df_ads_step7
+  )
+```
+
+## Step 9 : Get Final Data Frame
+
+```{r, message=FALSE, warning=FALSE}
+list_of_df_final <- step_9_final_df(
+  my_variables = my_variables,
+  df_ads_step7 = df_ads_step7
+)
+daily_df <- list_of_df_final[[1]]
+optional_step_9.5_plot_final_df(df_final = list_of_df_final[[1]]) # for daily data
+head(daily_df)
+tail(daily_df)
+names(daily_df)
+```
+
+# Time Series Forecasting
+
+### Step 1 : Input
+
+```{r, message=FALSE, warning=FALSE}
+robyn_directory <- "./robyn"
+```
+
+```{r, message=FALSE, warning=FALSE}
+InputCollect <- robyn_inputs(
+  dt_input = daily_df,
+  dt_holidays = dt_prophet_holidays,
+  date_var = "DATE", # date format must be "2020-01-01"
+  dep_var = "total_revenue", # there should be only one dependent variable
+  dep_var_type = "revenue", # "revenue" (ROI) or "conversion" (CPA)
+  prophet_vars = c("trend", "season", "weekday", "monthly", "holiday"), # "trend","season", "weekday" & "holiday"
+  prophet_country = "DE", # input country code. Check: dt_prophet_holidays
+  # context_vars = c("competitor_sales_B", "events"), # e.g. competitors, discount, unemployment etc
+  paid_media_spends = c("spend_Facebook", "spend_TV", "spend_Long_Form_Video", "spend_Search"), # mandatory input
+  paid_media_vars = c("impressions_Facebook", "impressions_TV", "impressions_Long_Form_Video", "clicks_Search"), # mandatory.
+  # paid_media_vars must have same order as paid_media_spends. Use media exposure metrics like
+  # impressions, GRP etc. If not applicable, use spend instead.
+  # organic_vars = "newsletter", # marketing activity without media spend
+  # factor_vars = c("events"), # force variables in context_vars or organic_vars to be categorical
+  window_start = "2017-01-01",
+  window_end = "2018-12-31",
+  adstock = "geometric" # geometric, weibull_cdf or weibull_pdf.
+)
+print(InputCollect)
+```
+
+```{r, message=FALSE, warning=FALSE}
+hyper_names(adstock = InputCollect$adstock, all_media = InputCollect$all_media)
+```
+
+```{r, message=FALSE, warning=FALSE}
+plot_adstock(plot = TRUE)
+plot_saturation(plot = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+hyper_limits()
+
+# Example hyperparameters ranges for Geometric adstock
+hyperparameters <- list(
+  spend_Facebook_alphas = c(0.5, 3),
+  spend_Facebook_gammas = c(0.3, 1),
+  spend_Facebook_thetas = c(0, 0.3),
+  spend_TV_alphas = c(0.5, 3),
+  spend_TV_gammas = c(0.3, 1),
+  spend_TV_thetas = c(0.1, 0.4),
+  spend_Long_Form_Video_alphas = c(0.5, 3),
+  spend_Long_Form_Video_gammas = c(0.3, 1),
+  spend_Long_Form_Video_thetas = c(0.3, 0.8),
+  spend_Search_alphas = c(0.5, 3),
+  spend_Search_gammas = c(0.3, 1),
+  spend_Search_thetas = c(0, 0.3),
+  train_size = c(0.5, 0.8)
+)
+```
+
+```{r, message=FALSE, warning=FALSE}
+InputCollect <- robyn_inputs(InputCollect = InputCollect, hyperparameters = hyperparameters)
+print(InputCollect)
+```
+
+### Step 2 : Build initial model
+
+```{r, message=FALSE, warning=FALSE}
+Sys.setenv(KMP_DUPLICATE_LIB_OK = "TRUE")
+
+OutputModels <- robyn_run(
+  InputCollect = InputCollect, # feed in all model specification
+  cores = NULL, # NULL defaults to (max available - 1)
+  iterations = 10, # 2000 recommended for the dummy dataset with no calibration
+  trials = 5, # 5 recommended for the dummy dataset
+  ts_validation = TRUE, # 3-way-split time series for NRMSE validation.
+  add_penalty_factor = FALSE # Experimental feature. Use with caution.
+)
+```
+
+```{r, message=FALSE, warning=FALSE}
+print(OutputModels)
+
+OutputModels$convergence$moo_distrb_plot
+OutputModels$convergence$moo_cloud_plot
+
+if (OutputModels$ts_validation) OutputModels$ts_validation_plot
+```
+
+```{r, message=FALSE, warning=FALSE}
+OutputCollect <- robyn_outputs(
+  InputCollect, OutputModels,
+  pareto_fronts = "auto", # automatically pick how many pareto-fronts to fill min_candidates (100)
+  min_candidates = 2, # top pareto models for clustering. Default to 100
+  # calibration_constraint = 0.1, # range c(0.01, 0.1) & default at 0.1
+  csv_out = "pareto", # "pareto", "all", or NULL (for none)
+  clusters = FALSE, # Set to TRUE to cluster similar models by ROAS. See ?robyn_clusters
+  export = create_files, # this will create files locally
+  plot_folder = robyn_directory, # path for plots exports and files creation
+  plot_pareto = create_files # Set to FALSE to deactivate plotting and saving model one-pagers
+)
+print(OutputCollect)
+```
+
+```{r, message=FALSE, warning=FALSE}
+select_model <- "3_2_5" # Pick one of the models from OutputCollect to proceed
+
+#### Version >=3.7.1: JSON export and import (faster and lighter than RDS files)
+ExportedModel <- robyn_write(InputCollect, OutputCollect, select_model, export = create_files)
+print(ExportedModel)
+
+# To plot any model's one-pager:
+myOnePager <- robyn_onepagers(InputCollect, OutputCollect, select_model, export = FALSE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+InputCollect$paid_media_spends

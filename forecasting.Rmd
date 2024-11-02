@@ -1,0 +1,546 @@
+---
+title: "Time Series Forecasting with Prophet"
+author: "Emiliia Lekhman"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Introduction
+
+This report presents a time series forecasting model using the Prophet library in R.
+
+## Load Libraries
+
+```{r, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(lubridate)
+library(tidyr)
+library(gridExtra)
+library(tidyverse)
+library(zoo)
+library(forecast)
+library(prophet)
+library(Metrics)
+```
+
+# Load data
+```{r, message=FALSE, warning=FALSE}
+# Load datasets
+train <- read_csv("data/train.csv")
+test <- read_csv("data/test.csv")
+stores <- read_csv("data/stores.csv")
+oil <- read_csv("data/oil.csv")
+holidays <- read_csv("data/holidays_events.csv")
+```
+
+```{r}
+length(unique(rownames(train)))
+```
+
+```{r, message=FALSE, warning=FALSE}
+head(train)
+```
+
+```{r, message=FALSE, warning=FALSE}
+str(train)
+str(test)
+str(stores)
+str(oil)
+str(holidays)
+```
+
+# Data Preprocessing
+
+```{r, message=FALSE, warning=FALSE}
+# Convert date to date format
+train$date <- as.Date(train$date)
+test$date <- as.Date(test$date)
+oil$date <- as.Date(oil$date)
+holidays$date <- as.Date(holidays$date)
+```
+
+```{r}
+length(unique(rownames(train)))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Merge train datasets
+train <- train %>% left_join(stores, by = "store_nbr")
+train <- train %>% left_join(oil, by = "date")
+train <- train %>% left_join(holidays, by = "date")
+names(train)[names(train) == "type.x"] <- "type.store"
+names(train)[names(train) == "type.y"] <- "type.holiday"
+head(train)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Merge test datasets
+test <- test %>% left_join(stores, by = "store_nbr")
+test <- test %>% left_join(oil, by = "date")
+test <- test %>% left_join(holidays, by = "date")
+names(test)[names(test) == "type.x"] <- "type.store"
+names(test)[names(test) == "type.y"] <- "type.holiday"
+head(test)
+```
+
+```{r, message=FALSE, warning=FALSE}
+duplicates <- train %>%
+  group_by(date, store_nbr, family) %>%
+  summarise(count = n()) %>%
+  filter(count > 1)
+
+# Print the result
+if (nrow(duplicates) == 0) {
+  print("No duplicate combinations of store_nbr and family for each date.")
+} else {
+  print("There are duplicate combinations of store_nbr and family for some dates.")
+  print(duplicates)
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+store_city_check <- train %>%
+  group_by(store_nbr) %>%
+  summarise(unique_cities = n_distinct(city)) %>%
+  filter(unique_cities > 1)
+
+# Print the result
+if (nrow(store_city_check) == 0) {
+  print("Each store_nbr is associated with only one unique city.")
+} else {
+  print("Some store_nbr values are associated with multiple cities.")
+  print(store_city_check)
+}
+```
+ 
+```{r, message=FALSE, warning=FALSE}
+# Check missing values in train dataset
+sapply(train, function(x) sum(is.na(x)))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Check missing values in test dataset
+sapply(test, function(x) sum(is.na(x)))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Fill missing values
+train$onpromotion[is.na(train$onpromotion)] <- 0
+train$dcoilwtico <- na.fill(train$dcoilwtico, fill = "extend")
+train$dcoilwtico <- na.approx(train$dcoilwtico)
+train$transferred[is.na(train$transferred)] <- "False"
+train$locale_name[is.na(train$locale_name)] <- "Unknown"
+train$locale[is.na(train$locale)] <- "Unknown"
+train$type.holiday[is.na(train$type.holiday)] <- "Unknown"
+train$description[is.na(train$description)] <- "Unknown"
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Fill missing values in test dataset
+test$onpromotion[is.na(test$onpromotion)] <- 0
+test$dcoilwtico <- na.fill(test$dcoilwtico, fill = "extend")
+test$dcoilwtico <- na.approx(test$dcoilwtico)
+test$transferred[is.na(test$transferred)] <- "False"
+test$locale_name[is.na(test$locale_name)] <- "Unknown"
+test$locale[is.na(test$locale)] <- "Unknown"
+test$type.holiday[is.na(test$type.holiday)] <- "Unknown"
+test$description[is.na(test$description)] <- "Unknown"
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# Check missing values again
+sapply(train, function(x) sum(is.na(x)))
+sapply(test, function(x) sum(is.na(x)))
+```
+
+
+# Exploratory Data Analysis
+
+## General Sales Trends
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  group_by(date) %>%
+  summarize(total_sales = sum(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = date, y = total_sales)) +
+  geom_line(color = "blue") +
+  labs(title = "Total Sales Over Time", x = "Date", y = "Total Sales")
+```
+
+## Sales by Store Family
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  group_by(family) %>%
+  summarize(total_sales = sum(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = family, y = total_sales)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Total Sales by Family", x = "Family", y = "Total Sales") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate text
+```
+
+## Sales by Holiday Type
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  filter(type.holiday != "Unknown") %>%  # Exclude "Unknown" holiday type
+  group_by(type.holiday) %>%
+  summarize(total_sales = sum(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = type.holiday, y = total_sales)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Total Sales by Holiday Type", x = "Holiday Type", y = "Total Sales")
+```
+
+## Sales by Locale
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  filter(locale_name != "Unknown") %>%
+  group_by(locale_name) %>%
+  summarize(total_sales = sum(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = locale_name, y = total_sales)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Total Sales by Locale", x = "Locale", y = "Total Sales") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## Oil Price Trends
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  ggplot(aes(x = date, y = dcoilwtico)) +
+  geom_line(color = "blue") +
+  labs(title = "Oil Price Over Time", x = "Date", y = "Oil Price")
+```
+
+## Sales vs. Promotions
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  group_by(onpromotion) %>%
+  summarize(avg_sales = mean(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = onpromotion, y = avg_sales)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Average Sales by Number of Promotions", x = "Number of Promotions", y = "Average Sales")
+```
+
+## Seasonality Analysis
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  mutate(dayOfWeek = wday(date, label = TRUE)) %>%
+  group_by(dayOfWeek) %>%
+  summarize(avg_sales = mean(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = dayOfWeek, y = avg_sales)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Average Sales by Day of Week", x = "Day of the Week", y = "Average Sales")
+```
+
+## Impact of Holidays on Sales
+
+```{r, message=FALSE, warning=FALSE}
+train %>%
+  filter(type.holiday == "Holiday" | type.holiday == "Event") %>%
+  group_by(date, type.holiday) %>%
+  summarize(total_sales = sum(sales, na.rm = TRUE)) %>%
+  ggplot(aes(x = date, y = total_sales, color = type.holiday)) +
+  geom_line() +
+  labs(title = "Total Sales by Holiday Type", x = "Date", y = "Total Sales")
+```
+
+# Time Series Analysis
+
+## Time Series Decomposition
+
+```{r, message=FALSE, warning=FALSE}
+  # Aggregate sales by date
+  daily_sales <- train %>%
+    group_by(date) %>%
+    summarize(total_sales = sum(sales))
+
+  # Decompose the time series
+  decomposition <- stl(ts(daily_sales$total_sales, frequency = 7), s.window = "periodic")
+  plot(decomposition)
+```
+
+## ACF and PACF Plots
+
+```{r, message=FALSE, warning=FALSE}
+  # ACF and PACF plots
+  acf(daily_sales$total_sales, main = "ACF Plot")
+  pacf(daily_sales$total_sales, main = "PACF Plot")
+```
+
+# Time Series Forecasting  
+
+## Prepare Data for Prophet
+
+```{r, message=FALSE, warning=FALSE}
+train$type.holiday <- as.factor(train$type.holiday)
+train$store_nbr <- as.factor(train$store_nbr)
+train$family <- as.factor(train$family)
+train$city <- as.factor(train$city)
+train$state <- as.factor(train$state)
+train$type.store <- as.factor(train$type.store)
+train$cluster <- as.factor(train$cluster)
+train$type.holiday <- as.factor(train$type.holiday)
+train$locale <- as.factor(train$locale)
+train$locale_name <- as.factor(train$locale_name)
+train$transferred <- as.factor(train$transferred)
+train$description <- as.factor(train$description)
+
+test$type.holiday <- as.factor(test$type.holiday)
+test$store_nbr <- as.factor(test$store_nbr)
+test$family <- as.factor(test$family)
+test$city <- as.factor(test$city)
+test$state <- as.factor(test$state)
+test$type.store <- as.factor(test$type.store)
+test$cluster <- as.factor(test$cluster)
+test$type.holiday <- as.factor(test$type.holiday)
+test$locale <- as.factor(test$locale)
+test$locale_name <- as.factor(test$locale_name)
+test$transferred <- as.factor(test$transferred)
+test$description <- as.factor(test$description)
+
+train_prophet <- train %>%
+  rename(ds = date, y = sales)
+
+str(train_prophet)
+head(train_prophet)
+tail(train_prophet)
+```
+
+## Train and Validation Split
+
+```{r, message=FALSE, warning=FALSE}
+split_ratio <- 0.9
+train_size <- floor(split_ratio * nrow(train_prophet))
+
+train_data <- train_prophet[1:train_size, ]
+val_data <- train_prophet[(train_size + 1):nrow(train_prophet), ]
+
+dim(train_data)
+dim(val_data)
+dim(test)
+```
+
+
+## Fit the baseline model
+
+```{r, message=FALSE, warning=FALSE}
+# model_baseline <- prophet(train_data)
+# saveRDS(model_baseline, file="model_baseline.RDS")
+```
+
+## Fit the all_features model
+
+```{r, message=FALSE, warning=FALSE}
+# model_all_features <- prophet()
+# model_all_features <- add_regressor(model_all_features, 'store_nbr', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'family', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'onpromotion')
+# model_all_features <- add_regressor(model_all_features, 'city', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'state', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'type.store', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'cluster', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'dcoilwtico')
+# model_all_features <- add_regressor(model_all_features, 'type.holiday', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'locale', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'locale_name', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'description', standardize = FALSE)
+# model_all_features <- add_regressor(model_all_features, 'transferred', standardize = FALSE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# model_all_features <- fit.prophet(model_all_features, train_data)
+# saveRDS(model_all_features, file="model_all_features.RDS")
+```
+
+
+## Fit the some_features model
+
+```{r, message=FALSE, warning=FALSE}
+# model_some_features <- prophet()
+# model_some_features <- add_regressor(model_some_features, 'family', standardize = FALSE)
+# model_some_features <- add_regressor(model_some_features, 'onpromotion')
+# model_some_features <- add_regressor(model_some_features, 'city', standardize = FALSE)
+# model_some_features <- add_regressor(model_some_features, 'type.store', standardize = FALSE)
+# model_some_features <- add_regressor(model_some_features, 'dcoilwtico')
+# model_some_features <- add_regressor(model_some_features, 'type.holiday', standardize = FALSE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# model_some_features <- fit.prophet(model_some_features, train_data)
+# saveRDS(model_some_features, file="model_some_features.RDS")
+```
+
+## Fit the models with parameters
+
+```{r, message=FALSE, warning=FALSE}
+# # Prepare holidays data (assuming holidays data is already included in `train_data`)
+# holidays <- train_data %>%
+#   filter(type.holiday != "Unknown") %>%  # Filter out non-holiday rows
+#   select(ds = ds, holiday = type.holiday) %>%  # Rename columns to match Prophet's expected format
+#   distinct()
+
+# # Define a changepoint for the earthquake date
+# earthquake_changepoint <- as.Date("2016-04-16")
+
+# # Set up the Prophet model with holidays, additional regressors, and a custom changepoint
+# model_with_params <- prophet(
+#   holidays = holidays, 
+#   yearly.seasonality = TRUE, 
+#   weekly.seasonality = TRUE, 
+#   daily.seasonality = FALSE, 
+#   seasonality.mode = 'additive', 
+#   changepoints = c(earthquake_changepoint)  # Adding earthquake as a custom changepoint
+# )
+
+# # Add each additional feature in the dataset as a regressor
+# model_with_params <- add_regressor(model_with_params, 'store_nbr')
+# model_with_params <- add_regressor(model_with_params, 'family')
+# model_with_params <- add_regressor(model_with_params, 'onpromotion')
+# model_with_params <- add_regressor(model_with_params, 'city')
+# model_with_params <- add_regressor(model_with_params, 'state')
+# model_with_params <- add_regressor(model_with_params, 'type.store')
+# model_with_params <- add_regressor(model_with_params, 'cluster')
+# model_with_params <- add_regressor(model_with_params, 'dcoilwtico')
+# model_with_params <- add_regressor(model_with_params, 'locale_name')
+# model_with_params <- add_regressor(model_with_params, 'description')
+# model_with_params <- add_regressor(model_with_params, 'transferred')
+```
+
+```{r, message=FALSE, warning=FALSE}
+# # Fit the model
+# model_with_params <- fit.prophet(model_with_params, train_data)
+# saveRDS(model_with_params, file="model_with_params.RDS")
+```
+
+## Load the models 
+
+```{r loading-baseline-model, message=FALSE, warning=FALSE}
+model_baseline <- readRDS(file="model_baseline.RDS") 
+```
+
+```{r loading-all-f-model, message=FALSE, warning=FALSE}
+model_all_features <- readRDS(file="model_all_features.RDS")
+```
+
+```{r loading-some-f-model, message=FALSE, warning=FALSE}
+model_some_features <- readRDS(file="model_some_features.RDS")
+```
+
+```{r loading-params-model, message=FALSE, warning=FALSE}
+model_with_params <- readRDS(file="model_with_params.RDS")
+```
+
+## Forecast
+
+```{r, message=FALSE, warning=FALSE}
+test <- test %>%
+  rename(ds = date)
+```
+
+## Generate forecast
+
+```{r forecasting, message=FALSE, warning=FALSE}
+forecast_baseline <- predict(model_baseline, val_data)
+forecast_all_features <- predict(model_all_features, val_data)
+forecast_some_features <- predict(model_some_features, val_data)
+forecast_with_params <- predict(model_with_params, val_data)
+```
+
+## Plot forecast
+
+```{r, message=FALSE, warning=FALSE}
+plot_forecast <- function(train_data, forecast_data, title = "Actual vs Forecasted Sales Over Time") {
+  # Summarize actual sales from the train dataset
+  actual_sales <- train_data %>%
+    group_by(date) %>%
+    summarize(total_sales = sum(sales, na.rm = TRUE))
+  
+  # Prepare forecast data for plotting
+  forecast_sales <- forecast_data %>%
+    select(ds, yhat) %>%
+    rename(date = ds, forecasted_sales = yhat) %>%
+    group_by(date) %>%
+    summarize(total_forecasted_sales = sum(forecasted_sales, na.rm = TRUE))
+  
+  # Combine actual and forecasted sales into one dataframe
+  plot_data <- actual_sales %>%
+    full_join(forecast_sales, by = "date")
+  
+  # Plot actual vs. forecasted sales
+  ggplot(plot_data, aes(x = date)) +
+    geom_line(aes(y = total_sales), color = "blue", size = 1, na.rm = TRUE) +
+    geom_line(aes(y = total_forecasted_sales), color = "red", linetype = "dashed", size = 1, na.rm = TRUE) +
+    labs(title = title, x = "Date", y = "Sales") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+plot_forecast(train, forecast_baseline, "Actual vs Baseline Forecasted Sales")
+plot_forecast(train, forecast_all_features, "Actual vs All Features Forecasted Sales")
+plot_forecast(train, forecast_some_features, "Actual vs Some Features Forecasted Sales")
+plot_forecast(train, forecast_with_params, "Actual vs Model with Parameters Forecasted Sales")
+```
+
+```{r, message=FALSE, warning=FALSE}
+prophet_plot_components(model_baseline, forecast_baseline)
+```
+
+```{r, message=FALSE, warning=FALSE}
+prophet_plot_components(model_all_features, forecast_all_features)
+```
+
+```{r, message=FALSE, warning=FALSE}
+prophet_plot_components(model_some_features, forecast_some_features)
+```
+
+```{r, message=FALSE, warning=FALSE}
+prophet_plot_components(model_with_params, forecast_with_params)
+```
+
+## Model Evaluation
+
+```{r, message=FALSE, warning=FALSE}
+rmlse <- function(actual, forecast) {
+  sqrt(mean((log1p(actual) - log1p(forecast))^2))
+}
+
+# Updated evaluation function to include RMLSE
+evaluate_forecast <- function(actual, forecast) {
+  mae <- mae(actual, forecast)
+  mse <- mse(actual, forecast)
+  rmse <- rmse(actual, forecast)
+  rmlse_value <- rmlse(actual, forecast)
+  return(data.frame(MAE = mae, MSE = mse, RMSE = rmse, RMLSE = rmlse_value))
+}
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Extract the actual values from val_data
+actual_values <- val_data$y
+
+# Get the forecasted values from each model
+forecast_baseline_values <- forecast_baseline$yhat
+forecast_all_features_values <- forecast_all_features$yhat
+forecast_some_features_values <- forecast_some_features$yhat
+forecast_with_params_values <- forecast_with_params$yhat
+
+# Evaluate each model
+baseline_metrics <- evaluate_forecast(actual_values, forecast_baseline_values)
+some_features_metrics <- evaluate_forecast(actual_values, forecast_some_features_values)
+all_features_metrics <- evaluate_forecast(actual_values, forecast_all_features_values)
+params_metrics <- evaluate_forecast(actual_values, forecast_with_params_values)
+# Compare metrics
+comparison <- rbind(baseline_metrics, all_features_metrics, some_features_metrics, params_metrics)
+rownames(comparison) <- c("Baseline Model", "All Features Model", "Some Features Model", "Model with Parameters")
+print(comparison)
+```
